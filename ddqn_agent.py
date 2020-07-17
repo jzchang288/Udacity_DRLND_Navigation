@@ -1,5 +1,6 @@
 import numpy as np
 import random
+import heapq
 from collections import deque, namedtuple
 
 from model import QNetwork
@@ -7,7 +8,7 @@ from model import QNetwork
 import torch
 import torch.optim as optim
 
-DEBUG_ON = True         # control whether assert statements for debugging are executed
+DEBUG_ON = False        # control whether assert statements for debugging are executed
 
 BUFFER_SIZE = int(1e5)  # replay buffer size
 BATCH_SIZE = 64         # minibatch size
@@ -18,18 +19,52 @@ UPDATE_EVERY = 4        # how often to update the target network parameters
 INIT_PRIO = 1.0         # initial priority for prioritized experience replay
 PRIO_ALPHA = 0.7        # exponent applied to priority to obtain probability
 
+# Encode an action value into a two-element vector. First index encodes moves with zero being non-move,
+# and the seond encodes turns with zero being non-turn.
+ACT_INVALID = -1
+ACT_FORWARD = 0
+ACT_BACKWARD = 1
+ACT_LEFT = 2
+ACT_RIGHT = 3
+ACT_CODES = [np.array([ 1,  0], dtype=int), # work forward
+             np.array([-1,  0], dtype=int), # work backward
+             np.array([ 0,  1], dtype=int), # turn left
+             np.array([ 0, -1], dtype=int)] # turn right
+
+# Orientation vector table for obtaining the x-y orientation vector for calculating the new simulated position
+# resulting from from an agent action.
+NUM_ORIS = 12 # number of uniformly spaced orientations
+ORIVEC_TABLE = [np.array([np.cos(2*ori*np.pi/NUM_ORIS), np.sin(2*ori*np.pi/NUM_ORIS)]) for ori in range(NUM_ORIS)]
+
+# Lookup table for converting move code inferred from two consecutive simulated states to the next move action
+# to avoid if the observed states are essentially the same indicating a stucked agent.
+# mcode = -1 (moved backward) -- mcode+1 --> 0 -- lookup --> ACT_BACKWARD (avoid moving in same direction)
+# mcode = 0  (no movement)    -- mcode+1 --> 1 -- lookup --> ACT_INVALID (no move action to avoid)
+# mcode = 1  (moved forward)  -- mcode+1 --> 2 -- lookup --> ACT_FORWARD (avoid moving in same direction)
+# Table Index:      0,            1,           2
+AVOID_MOVE_TABLE = [ACT_BACKWARD, ACT_INVALID, ACT_FORWARD]
+
+# Lookup table for converting turn code inferred from two consecutive simulated states to the next turn action
+# avoid if the observed states are essentially the same indicating an agent in blind spot.
+# tcode = -1, NUM_ORIS-1   (turned right) --> (tcode+1)%NUM_ORIS --> 0 -- lookup --> ACT_LEFT (avoid turning back)
+# tcode = 0                (no turn)      --> (tcode+1)%NUM_ORIS --> 1 -- lookup --> ACT_INVALID (no turn action to avoid)
+# tcode = 1, -(NUM_ORIS-1) (turned left)  --> (tcode+1)%NUM_ORIS --> 2 -- lookup --> ACT_RIGHT (avoid turning back)
+# Table Index:      0,        1,           2
+AVOID_TURN_TABLE = [ACT_LEFT, ACT_INVALID, ACT_RIGHT]
+            
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
 class DDQNPERAgent():
     """Interacts with and learns from the environment."""
 
-    def __init__(self, state_size, action_size, lrn_rate, hsize1, hsize2, seed=0):
+    def __init__(self, state_size, action_size, tor_dstate, lrn_rate, hsize1, hsize2, seed=0):
         """Initialize a DDQN Agent object with PER (Prioritized Experience Replay) support.
         
         Params
         ======
             state_size (int): dimension of each state
             action_size (int): dimension of each action
+            tor_dstate (float): tolerance for deciding whether two states are the same            
             lrn_rate (float): learning rate for Q-Network training
             hsize1 (int): size of the first hidden layer of the Q-Network
             hsize2 (int): size of the second hidden layer of the Q-Network 
@@ -37,6 +72,7 @@ class DDQNPERAgent():
         """
         self.state_size = state_size
         self.action_size = action_size
+        self.tor_dstate = tor_dstate
         self.lrn_rate = lrn_rate
         
         self.hsize1 = hsize1
@@ -63,6 +99,29 @@ class DDQNPERAgent():
         self.l_step = 0 # for learning every LEARN_EVERY time steps
         self.t_step = 0 # for updating target network every UPDATE_EVERY learnings
     
+    def reset_epsisode(self, state, srpt_det=0):
+        """Re-initialize buffers after environment reset for a new episode.
+        
+        Params
+        ======
+            state (array_like): initial state after environment reset
+            srpt_det (int): number of repeated state types to be checked for post-processing
+        """
+        self.srpt_det = srpt_det
+        if srpt_det > 0:
+            self.state_buffer = deque(maxlen=2)
+            self.smsta_buffer = deque(maxlen=max(2, 2*(srpt_det-1)))
+        
+            # The initial state will be pushed to the buffer again and be compared to this state in the process of
+            # selecting the first action. So add 1 to the initial state here to ensure the states are different
+            # enough for the first comparison.
+            self.state_buffer.append(np.array(state) + 1)
+        
+            # Any position and orientation can be the initial simulated state here. It is like putting in a
+            # coordinate system (origin and x-direction) for a 2-D plane and all the other simulated states
+            # in the episode will be specified based on this reference coordinate system.
+            self.smsta_buffer.append((np.array([0, 0]), 0))
+               
     def step(self, state, action, reward, next_state, done):
         """Update replay memory and parameters of Q-Network by training.
         
@@ -85,6 +144,41 @@ class DDQNPERAgent():
                 experiences, weights = self.ebuffer.sample()
                 self.learn(experiences, weights, GAMMA)
 
+    def sim_step(self, action):
+        """Advance simulated state (position and orientation) for one step by the action.
+        
+        Params
+        ======
+            action (int): action to advance the simulated state
+        Returns
+            pos, ori (numpy.ndarray, int): resulting simulated state
+        """
+        # An action can either be a move or turn (but not both) with the type of actions (including non-actions)
+        # identified by the action code.
+        pos, ori = self.smsta_buffer[-1]
+        act_code = ACT_CODES[action]
+        pos = pos + act_code[0] * ORIVEC_TABLE[ori]
+        ori = (ori + act_code[1]) % NUM_ORIS
+        return pos, ori
+    
+    def is_state_repeated(self, act_cnt, nxt_sta):
+        """Check whether the next state repeats the past state separated by the specified number of actions.
+        
+        Params
+        ======
+            act_cnt (int): number of actions separating the past state to be checked and the next state
+            nxt_sta (numpy.ndarray, int): next state resulting from an action
+        Returns
+        ======
+            repeated (bool): indicator for repeated state
+        """        
+        repeated = False
+        if act_cnt <= len(self.smsta_buffer):
+            chk_sta = self.smsta_buffer[-act_cnt] # past state to be checked
+            if chk_sta[1] == nxt_sta[1]:
+                if np.linalg.norm(nxt_sta[0] - chk_sta[0]) <= self.tor_dstate: repeated = True
+        return repeated
+                
     def act(self, state, eps=0.0):
         """Select action for given state as per epsilon-greedy current policy.
         
@@ -96,17 +190,106 @@ class DDQNPERAgent():
         ======
             action (int): the chosen action
         """
-        # Randomly select action.
-        action = random.choice(np.arange(self.action_size))
+        if self.srpt_det == 0: # no checking for repeated states (observed or simulated)
+            # Randomly select action.
+            action = random.choice(np.arange(self.action_size))
+            
+            # Epsilon-greedy action selection.
+            if random.random() >= eps:
+                state = torch.from_numpy(state).float().to(device)
+                self.qnetwork_local.eval()
+                with torch.no_grad(): action = self.qnetwork_local(state).squeeze().argmax().cpu().item()
+                
+            return action
         
+        # This is the implementation of the post-processing of the Epsilon-greedy policy to avoid repeated states
+        # within a short series of actions. To accomondate the post-processing of the selected actions, the random
+        # policy is modified to randomly assign rankings to all the available actions.
+        
+        # Push current state into state buffer for comparing with previous state.
+        self.state_buffer.append(np.array(state))
+        
+        # Randomly assign rankings to action candidates.
+        ranked_actions = np.random.permutation(self.action_size)
+                   
         # Epsilon-greedy action selection.
         if random.random() >= eps:
             state = torch.from_numpy(state).float().to(device)
             self.qnetwork_local.eval()
-            with torch.no_grad(): action = self.qnetwork_local(state).squeeze().argmax().cpu().item()
-            
+            with torch.no_grad(): neg_act_qvals = -self.qnetwork_local(state).squeeze()
+            ranked_actions = neg_act_qvals.argsort().cpu().numpy().astype(int)
+        
+        # Post-process ranked action candidates to remove undesirable action.
+        avoid_action = self.get_avoid_action()
+        action = self.select_nosrpt_action(avoid_action, ranked_actions)
+       
         return action
         
+    def get_avoid_action(self):
+        """Avoid action that will keep the agent stucked or in a blind spot. 
+        
+        Returns
+            avoid_action (int): next action to avoid
+        """
+        avoid_action = ACT_INVALID # used to sigal agent is not stucked or in a blind spot       
+        if np.linalg.norm(self.state_buffer[1] - self.state_buffer[0]) <= self.tor_dstate:
+            sim_sta0 = self.smsta_buffer[-2]
+            sim_sta1 = self.smsta_buffer[-1]
+            if sim_sta0[1] == sim_sta1[1]: # action is not a turn, must be a move
+                # Agent is stuck at a wall
+                dpos = sim_sta1[0] - sim_sta0[0]
+                mcode = np.around(np.dot(dpos, ORIVEC_TABLE[sim_sta0[1]])).astype(int) # dot(mcode*(cos, sin), (cos, sin)) = mcode
+                avoid_action = AVOID_MOVE_TABLE[mcode+1]
+                self.smsta_buffer.clear()          # it is reasonable to backtrack to get unstucked except the last state which
+                self.smsta_buffer.append(sim_sta0) # the agent is stucked in (as the new reference, it can be any state)           
+            else: # action is a turn
+                # Agent is in a blind spot (turned, but observed same state).
+                tcode = sim_sta1[1] - sim_sta0[1]
+                avoid_action = AVOID_TURN_TABLE[(tcode+1)%NUM_ORIS]    
+                self.smsta_buffer.clear()          # it is reasonable to backtrack to get out of blind
+                self.smsta_buffer.append(sim_sta0) # spot except the last two states, which represent
+                self.smsta_buffer.append(sim_sta1) # the blind spot                   
+        return avoid_action
+
+    def select_nosrpt_action(self, avoid_action, ranked_actions):
+        """Select action that avoids repeated state (i.e., loops) by a short series of actions.
+        
+        Params
+        ======
+            avoid_action (int): action to avoid if agent is stuck or in blind spot
+            ranked_actions (array like): action candidates ranked by decreasing Q-values
+        Returns
+        ======
+            action (int): the selected action
+        """
+        action = ranked_actions[0]
+        if action == avoid_action: action = ranked_actions[1]
+        nxt_sta = self.sim_step(action)
+                
+        # If repeated observed state by an action is detected (signaled by avoid_action != ACT_INVALID), the selected
+        # action for avoiding the repeated state will be used since it is more important to free a agent that is
+        # stucked or in a blind spot than to go back further to check for repeated simulated states. So the checking
+        # for repeated simulated states by 2 or more actions will only occur when avoid_action == ACT_INVALID.
+        if avoid_action == ACT_INVALID and self.srpt_det > 1:
+            act_heapq = []
+            for action in ranked_actions:
+                nxt_sta = self.sim_step(action)
+                for act_cnt in range(2, 2*self.srpt_det, 2): # assuming NUM_ORIS is even, only check even number of actions
+                    if self.is_state_repeated(act_cnt, nxt_sta):
+                        # Simulated state repeated, go checking next action.
+                        heapq.heappush(act_heapq, [-act_cnt, action, nxt_sta])
+                        break
+                else:
+                    # No repeated state detected, action is found.
+                    break
+            else:
+                # No action can satisfy all the no repeated state conditions, select the action that repeats the
+                # state separated by most actions (i.e., long loop is more acceptable than short loop).
+                action, nxt_sta = heapq.heappop(act_heapq)[1:]
+        
+        self.smsta_buffer.append(nxt_sta) # update simulated state buffer with result of chosen action.
+        return action
+          
     def learn(self, experiences, is_weights, gamma):
         """Update value parameters using given batch of experience tuples.
 
