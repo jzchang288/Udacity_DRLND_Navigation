@@ -5,3 +5,4 @@ Banana_Windows_x86_64
 # Files produced by running Jupyter Notebook code
 .ipynb_checkpoints
 unity-environment.log
+__pycache__
