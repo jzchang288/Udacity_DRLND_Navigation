@@ -57,14 +57,15 @@ device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 class DDQNPERAgent():
     """Interacts with and learns from the environment."""
 
-    def __init__(self, state_size, action_size, tor_dstate, lrn_rate, hsize1, hsize2, seed=0):
+    def __init__(self, state_size, action_size, tor_dstate, srpt_pens, lrn_rate, hsize1, hsize2, seed=0):
         """Initialize a DDQN Agent object with PER (Prioritized Experience Replay) support.
         
         Params
         ======
             state_size (int): dimension of each state
             action_size (int): dimension of each action
-            tor_dstate (float): tolerance for deciding whether two states are the same            
+            tor_dstate (float): tolerance for deciding whether two states are the same
+            srpt_pens (array_like): penalty (negative reward) values for undesirable actions
             lrn_rate (float): learning rate for Q-Network training
             hsize1 (int): size of the first hidden layer of the Q-Network
             hsize2 (int): size of the second hidden layer of the Q-Network 
@@ -73,6 +74,7 @@ class DDQNPERAgent():
         self.state_size = state_size
         self.action_size = action_size
         self.tor_dstate = tor_dstate
+        self.srpt_pens = srpt_pens
         self.lrn_rate = lrn_rate
         
         self.hsize1 = hsize1
@@ -80,11 +82,14 @@ class DDQNPERAgent():
         
         self.seed = seed
         if seed is not None: random.seed(seed)
+        
+        # Each penalty value adds a vector of action_size to signal which action causes the penalty.
+        self.aug_state_size = state_size + len(srpt_pens) * action_size
                     
         # Set up Q-Networks.
-        self.qnetwork_local = QNetwork(state_size, action_size, hsize1, hsize2, seed).to(device)
+        self.qnetwork_local = QNetwork(self.aug_state_size, action_size, hsize1, hsize2, seed).to(device)
         self.qnetwork_local.initialize_weights() # initialize network with random weights
-        self.qnetwork_target = QNetwork(state_size, action_size, hsize1, hsize2, seed=None).to(device)
+        self.qnetwork_target = QNetwork(self.aug_state_size, action_size, hsize1, hsize2, seed=None).to(device)
         self.qnetwork_target.update_weights(self.qnetwork_local) # copy network weights to target network
         self.qnetwork_target.eval()
         self.optimizer = optim.Adam(self.qnetwork_local.parameters(), lr=lrn_rate)
@@ -107,10 +112,18 @@ class DDQNPERAgent():
             state (array_like): initial state after environment reset
             srpt_det (int): number of repeated state types to be checked for post-processing
         """
-        self.srpt_det = srpt_det
-        if srpt_det > 0:
+        self.srpt_det = 0
+        if len(self.srpt_pens) == 0:
+            # State repeat detection for post-processing is active only when state repeat penalty option is off.
+            self.srpt_det = srpt_det
+        else:
+            # This is used to signal self.step() hasn't been run yet.
+            self.next_aug_state = None
+                
+        if len(self.srpt_pens) > 0 or self.srpt_det > 0:
             self.state_buffer = deque(maxlen=2)
-            self.smsta_buffer = deque(maxlen=max(2, 2*(srpt_det-1)))
+            buffer_size = 2 * (max(len(self.srpt_pens), self.srpt_det) - 1)
+            self.smsta_buffer = deque(maxlen=max(2, buffer_size))
         
             # The initial state will be pushed to the buffer again and be compared to this state in the process of
             # selecting the first action. So add 1 to the initial state here to ensure the states are different
@@ -133,6 +146,14 @@ class DDQNPERAgent():
             next_state (array_like): resulting state of the action in the step
             done (bool): indicator for whether next_state is terminal (i.e., end of episode) or not
         """
+        if len(self.srpt_pens) > 0:
+            # Augment state vector and modify reward using state repeat penalty values.
+            self.state_buffer.append(np.array(next_state))
+            self.next_aug_state = self.augment_state(next_state)
+            state = self.aug_state
+            next_state = self.next_aug_state
+            reward = self.modify_reward(reward, state, action)
+        
         # Save experience in replay memory.
         self.ebuffer.add(state, action, reward, next_state, done)
         
@@ -143,7 +164,61 @@ class DDQNPERAgent():
             if self.l_step == 0:
                 experiences, weights = self.ebuffer.sample()
                 self.learn(experiences, weights, GAMMA)
-
+        
+    def augment_state(self, state):
+        """Augment state vector to penalize undesirable actions.
+        
+        Params
+        ======
+            state (array_like): original state vector to be augmented
+        Returns
+        ======
+            aug_state (numpy.ndarray): augmented state vector
+        """
+        # Each penalty value adds a vector of action_size to signal which action causes the penalty.       
+        aug_state = np.concatenate((state, np.zeros((len(self.srpt_pens)*self.action_size,))))
+        
+        # Detect situation where the two preceeding observed states (not augmented) are essentially the
+        # same, which indicates the agent is either stucked at a wall or in some kind of undesirable
+        # blind spot. The next action to avoid (i.e., to be penalized) is the one that will keep the
+        # agent stuck or in blind spot.
+        avoid_action = self.get_avoid_action()
+        if avoid_action != ACT_INVALID: aug_state[self.state_size + avoid_action] = 1
+        if avoid_action != ACT_INVALID or len(self.srpt_pens) == 1: return aug_state
+        
+        # If agent is not stuck or in blind spot and there are more penalty values, continue to check
+        # state repeats separated by more than two actions. Assuming NUM_ORIS is even, states separated
+        # by odd number of actions won't repeat. So only even number of actions needs to be checked.
+        for action in range(self.action_size):
+            nxt_sta = self.sim_step(action)
+            for act_cnt in range(2, 2*len(self.srpt_pens), 2):
+                if self.is_state_repeated(act_cnt, nxt_sta):
+                    aug_state[self.state_size + (act_cnt // 2) * self.action_size + action] = 1 # signal undesirable action
+                    break
+        
+        return aug_state
+    
+    def modify_reward(self, reward, aug_state, action):
+        """Modify reward to penalized undesirable action.
+        
+        Params
+        ======
+            reward (float): original reward
+            aug_state (numpy.ndarray): augmented state vector
+            action (int): action performed
+        Returns
+        ======
+            reward (float): modified reward
+        """
+        # Penalize undesirable action when it doesn't earn a reward or cause a penalty. If it earns a positive
+        # reward or causes a more negative reward, leave the reward unchanged.
+        if reward <= 0:
+            for i, penalty in enumerate(self.srpt_pens):
+                if aug_state[self.state_size + i * self.action_size + action] > 0: # action is undesirable
+                    reward = min(reward, penalty)
+                    break
+        return reward
+    
     def sim_step(self, action):
         """Advance simulated state (position and orientation) for one step by the action.
         
@@ -190,6 +265,20 @@ class DDQNPERAgent():
         ======
             action (int): the chosen action
         """
+        # If the agent is in testing mode, self.step() won't be invoked and some of the operations done there
+        # need to be done here.
+        if (len(self.srpt_pens) > 0 and self.next_aug_state is None) or self.srpt_det > 0:
+            # Push current state into state buffer for comparing with previous state if it is not alraedy pushed
+            # by self.step() in the agent training process.
+            self.state_buffer.append(np.array(state))
+            
+        if len(self.srpt_pens) > 0:
+            if self.next_aug_state is None:
+                self.aug_state = self.augment_state(state)
+            else:
+                self.aug_state = self.next_aug_state
+            state = self.aug_state
+        
         if self.srpt_det == 0: # no checking for repeated states (observed or simulated)
             # Randomly select action.
             action = random.choice(np.arange(self.action_size))
@@ -199,15 +288,19 @@ class DDQNPERAgent():
                 state = torch.from_numpy(state).float().to(device)
                 self.qnetwork_local.eval()
                 with torch.no_grad(): action = self.qnetwork_local(state).squeeze().argmax().cpu().item()
+                    
+            if len(self.srpt_pens) > 0:
+                # Update simulated state buffer with result of chosen action.
+                nxt_sta = self.sim_step(action)
+                self.smsta_buffer.append(nxt_sta)
                 
             return action
         
         # This is the implementation of the post-processing of the Epsilon-greedy policy to avoid repeated states
-        # within a short series of actions. To accomondate the post-processing of the selected actions, the random
-        # policy is modified to randomly assign rankings to all the available actions.
-        
-        # Push current state into state buffer for comparing with previous state.
-        self.state_buffer.append(np.array(state))
+        # within a short series of actions. This option is set in self.reset_episode() for each espisode and is
+        # only active when the option of penalizing undesirable actions, which is set for the class object, is
+        # disabled when len(self.srpt_pens) == 0. To accomondate the post-processing of the selected actions, the
+        # random policy is modified to randomly assign rankings to all the available actions.
         
         # Randomly assign rankings to action candidates.
         ranked_actions = np.random.permutation(self.action_size)
@@ -345,7 +438,7 @@ class DDQNPERAgent():
     def copy_solved_qnet(self):
         """Copy current local Q-Network to solved Q-Network while local Q-Network will continue the training."""             
         if self.qnetwork_solved is None:
-            self.qnetwork_solved = QNetwork(self.state_size, self.action_size, self.hsize1, self.hsize2, seed=None).to(device)
+            self.qnetwork_solved = QNetwork(self.aug_state_size, self.action_size, self.hsize1, self.hsize2, seed=None).to(device)
         self.qnetwork_solved.update_weights(self.qnetwork_local) # copy local network weights to solved network
             
     def save_qnet(self, model_name):
@@ -371,7 +464,7 @@ class DDQNPERAgent():
             model_name (str): name of the Q-Network
         """
         # Saved QNetwork is alway the CPU version.
-        qnetwork_loaded = QNetwork(self.state_size, self.action_size, self.hsize1, self.hsize2, seed=None)
+        qnetwork_loaded = QNetwork(self.aug_state_size, self.action_size, self.hsize1, self.hsize2, seed=None)
         qnetwork_loaded.load_state_dict(torch.load(model_name+'.pth'))
         self.qnetwork_local.update_weights(qnetwork_loaded.to(device)) # copy loaded network weights to local network
 
