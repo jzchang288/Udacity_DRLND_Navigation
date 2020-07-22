@@ -29,7 +29,13 @@ The task is episodic, and in order to solve the environment, the agent must get 
 
 ## Instructions
 
-Instructions for testing the environment and experimenting with training and testing the agent are provided in `Navigation.ipynb`.
+The repository contains three modules:
+
+- `model.py`: Neutral network for implementing the model used by the agent to select its actions.
+- `ddqn_agent.py`: Code for implementing agent's behavior using the neutral network model.
+- `train_test.py`: Code for training and testing the agent.
+
+Step by step instructions for using the modules to test the environment and experiment with training and testing the agent are provided in `Navigation.ipynb`.
 
 ## Dependencies
 
