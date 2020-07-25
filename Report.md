@@ -40,6 +40,7 @@ The deep neural network used for the local and target models is a fully connecte
 - hsize1 (64): Size of the first hidden layer.
 - hsize2 (64): Size of the second hidden layer.
 - lrn_rate (7.5e-5): Learning rate for training the neural network.
+- optimizer (torch.optim.Adam): [Adam optimizer](https://pytorch.org/docs/stable/optim.html?highlight=adam#torch.optim.Adam) in PyTorch for training the neural network.
 
 #### Parameters for DDQN
 
