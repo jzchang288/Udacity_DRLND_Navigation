@@ -3,7 +3,7 @@
 [image1]: https://user-images.githubusercontent.com/10624937/42135619-d90f2f28-7d12-11e8-8823-82b970a54d7e.gif "Trained Agent"
 
 # Udacity DRLND Project 1: Navigation
-This is my implementation on Windows 10 of the Navigation Project (Project 1) of Udacity's [Deep Reinforcement Learning Nanodegree (DRLND)](https://www.udacity.com/course/deep-reinforcement-learning-nanodegree--nd893) program. Original information about this project can be found in [Udacity's GitHub repository for this project](https://github.com/udacity/deep-reinforcement-learning/tree/master/p1_navigation).
+This is an implementation on Windows 10 of the Navigation Project (Project 1) of Udacity's [Deep Reinforcement Learning Nanodegree (DRLND)](https://www.udacity.com/course/deep-reinforcement-learning-nanodegree--nd893) program. Original information about this project and the starter code can be found in [Udacity's GitHub repository for this project](https://github.com/udacity/deep-reinforcement-learning/tree/master/p1_navigation).
 
 ## Introduction
 
@@ -25,7 +25,7 @@ The task is episodic, and in order to solve the environment, the agent must get 
 
 1. Download the environment from Udacity using this link (for 64-bit Windows only): https://s3-us-west-1.amazonaws.com/udacity-drlnd/P1/Banana/Banana_Windows_x86_64.zip.
 
-2. Place the file in the repository and unzip it there.
+2. Place the file in the repository and unzip it there creating a `Banana_Windows_x86_64` folder.
 
 ## Instructions
 
@@ -35,7 +35,7 @@ The repository contains three modules:
 - `ddqn_agent.py`: Code for implementing agent's behavior using the neutral network model.
 - `train_test.py`: Code for training and testing the agent.
 
-Step by step instructions for using the modules to test the environment and experiment with training and testing the agent are provided in `Navigation.ipynb`.
+Step by step instructions for using the modules to test the environment and experiment with training and testing the agent are provided in `Navigation.ipynb`. Detail discussions of the implementation are in `Report.md`.
 
 ## Dependencies
 
@@ -57,5 +57,7 @@ To set up the Python environment to run the code in the repository, follow the i
 3. Navigate to the `python/` folder in the repository and install dependencies specified there.
 
    ```bash
+   cd Udacity_DRLND_Navigation/python
    pip install .
    ```
+   
