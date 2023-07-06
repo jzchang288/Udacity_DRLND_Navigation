@@ -9,5 +9,5 @@ pyyaml
 protobuf>=3.8.0
 grpcio>=1.24.3
 pandas
-scipy==1.4.1
+scipy==1.10.0
 ipykernel
